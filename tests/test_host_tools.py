@@ -12,6 +12,7 @@ import httpx
 import pytest
 from omp_rpc import HostToolContext, RpcCommandError
 
+from robomp import host_tools
 from robomp.db import Database
 from robomp.github_client import GitHubClient, IssueInfo, RepoInfo
 from robomp.host_tools import AbortController, ToolBindings, build
@@ -74,7 +75,7 @@ def _stop_loop(loop: asyncio.AbstractEventLoop, t: threading.Thread) -> None:
 
 
 def _bindings(
-    db: Database, tmp_path: Path, transport: httpx.MockTransport
+    db: Database, tmp_path: Path, transport: httpx.MockTransport, *, slot_uid: int | None = None
 ) -> tuple[ToolBindings, asyncio.AbstractEventLoop, threading.Thread]:
     github = GitHubClient("token", transport=transport)
     loop, thread = _make_loop_in_background()
@@ -88,6 +89,7 @@ def _bindings(
         loop=loop,
         author_name="robomp-bot",
         author_email="robomp-bot@example.invalid",
+        slot_uid=slot_uid,
     )
     db.upsert_issue(
         key=bindings.issue_key,
@@ -102,6 +104,137 @@ def _bindings(
 
 def _ctx() -> HostToolContext[Any]:
     return HostToolContext(tool_call_id="tc-1", _cancel_event=threading.Event(), _send_update=lambda _payload: None)
+
+
+def test_repo_command_env_scrubs_secrets_and_uses_workspace_cache(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "secret-token")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "secret-webhook")
+    monkeypatch.setenv("ROBOMP_GH_PROXY_HMAC_KEY", "secret-proxy")
+    monkeypatch.setenv("BUN_INSTALL_CACHE_DIR", "/data/cache/bun-cache")
+
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    try:
+        env = host_tools._repo_command_env(bindings)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert env["GITHUB_TOKEN"] == ""
+    assert env["GITHUB_WEBHOOK_SECRET"] == ""
+    assert env["ROBOMP_GH_PROXY_HMAC_KEY"] == ""
+    assert env["BUN_INSTALL_CACHE_DIR"] == str(bindings.workspace.root / ".omp-xdg" / "cache" / "bun-install")
+    assert env["XDG_CACHE_HOME"] == str(bindings.workspace.root / ".omp-xdg" / "cache")
+    assert env["TMPDIR"] == str(bindings.workspace.root / ".omp-tmp")
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == str(bindings.workspace.repo_dir)
+    assert env["GIT_AUTHOR_NAME"] == bindings.author_name
+    assert env["GIT_AUTHOR_EMAIL"] == bindings.author_email
+    assert env["GIT_COMMITTER_NAME"] == bindings.author_name
+    assert env["GIT_COMMITTER_EMAIL"] == bindings.author_email
+    assert (bindings.workspace.root / ".omp-tmp").is_dir()
+
+
+def test_run_repo_command_uses_slot_identity_kwargs(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    bindings, loop, thread = _bindings(db, tmp_path, httpx.MockTransport(lambda _r: httpx.Response(500)), slot_uid=2001)
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        host_tools,
+        "_slot_subprocess_kwargs",
+        lambda uid: {"user": uid, "group": uid, "extra_groups": [2000], "umask": 0o002},
+    )
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+    monkeypatch.setattr(host_tools.subprocess, "run", fake_run)  # type: ignore[attr-defined]
+    try:
+        proc = host_tools._run_repo_command(bindings, ["git", "status"])
+    finally:
+        _stop_loop(loop, thread)
+
+    assert proc.stdout == "ok"
+    assert captured["cmd"] == ["git", "status"]
+    kwargs = captured["kwargs"]
+    assert kwargs["cwd"] == str(bindings.workspace.repo_dir)
+    assert kwargs["user"] == 2001
+    assert kwargs["group"] == 2001
+    assert kwargs["extra_groups"] == [2000]
+    assert kwargs["umask"] == 0o002
+    assert kwargs["env"]["BUN_INSTALL_CACHE_DIR"].endswith("/.omp-xdg/cache/bun-install")
+
+
+def test_guarded_push_branch_rev_parse_runs_via_repo_command_and_passes_slot_uid(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    from dataclasses import replace
+
+    from robomp.git_ops import PushResult
+
+    class RecordingTransport:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def push_branch(self, **kwargs: Any) -> PushResult:
+            self.calls.append(kwargs)
+            return PushResult(head=str(kwargs["expected_head"]), branch=str(kwargs["branch"]))
+
+    transport = RecordingTransport()
+    bindings, loop, thread = _bindings(
+        db,
+        tmp_path,
+        httpx.MockTransport(lambda _r: httpx.Response(500)),
+        slot_uid=2001,
+    )
+    bindings = replace(bindings, git_transport=transport)
+    commands: list[list[str]] = []
+
+    def fake_run_repo_command(
+        command_bindings: ToolBindings, cmd: list[str] | tuple[str, ...], *, timeout: float | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout
+        assert command_bindings.slot_uid == 2001
+        command = list(cmd)
+        commands.append(command)
+        if command == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(command, 0, "abc123\n", "")
+        if command[:3] == ["git", "log", "--format=%H%x09%ae%x09%an"]:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "abc123\trobomp-bot@example.invalid\trobomp-bot\n",
+                "",
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(host_tools, "_run_repo_command", fake_run_repo_command)
+    monkeypatch.setattr(host_tools, "_share_git_metadata_with_slots", lambda _repo_dir, _slot_uid: None)
+    try:
+        head = host_tools._guarded_push_branch(bindings, {}, "gh_push_branch", bindings.workspace.branch)
+    finally:
+        _stop_loop(loop, thread)
+
+    assert head == "abc123"
+    assert ["git", "rev-parse", "HEAD"] in commands
+    assert transport.calls == [
+        {
+            "repo": "octo/widget",
+            "workspace_key": "octo__widget__42",
+            "repo_dir": bindings.workspace.repo_dir,
+            "branch": bindings.workspace.branch,
+            "expected_head": "abc123",
+            "slot_uid": 2001,
+        }
+    ]
 
 
 def test_gh_post_comment_happy_path(db: Database, tmp_path: Path) -> None:
@@ -244,6 +377,31 @@ def test_repro_record_writes_transcript(db: Database, tmp_path: Path) -> None:
         files = list(bindings.workspace.repro_dir.iterdir())
         assert len(files) == 1
         assert "exit_code: 1" in files[0].read_text()
+    finally:
+        _stop_loop(loop, t)
+
+
+def test_repro_record_chowns_to_slot_when_root(db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    chowns: list[tuple[Path, int, int]] = []
+    monkeypatch.setattr(host_tools, "_slot_permissions_active", lambda slot_uid: slot_uid is not None)
+    monkeypatch.setattr("robomp.host_tools.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)), slot_uid=2001)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "repro_record")
+        result = tool.execute(
+            {
+                "title": "panic on empty input",
+                "command": "bun test foo.test.ts",
+                "output": "Error: boom",
+                "exit_code": 1,
+            },
+            _ctx(),
+        )
+        assert result == "recorded"
+        files = list(bindings.workspace.repro_dir.iterdir())
+        assert len(files) == 1
+        assert chowns == [(files[0], 2001, 2001)]
     finally:
         _stop_loop(loop, t)
 

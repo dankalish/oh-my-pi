@@ -368,17 +368,18 @@ class ProxyGitTransport:
         repo_dir: Path,
         branch: str,
         expected_head: str,
+        slot_uid: int | None = None,
     ) -> PushResult:
         del repo_dir
-        data = self._post(
-            "/gh/v1/git/push",
-            {
-                "repo": repo,
-                "workspace_key": workspace_key,
-                "branch": branch,
-                "expected_head": expected_head,
-            },
-        )
+        body: dict[str, Any] = {
+            "repo": repo,
+            "workspace_key": workspace_key,
+            "branch": branch,
+            "expected_head": expected_head,
+        }
+        if slot_uid is not None:
+            body["slot_uid"] = slot_uid
+        data = self._post("/gh/v1/git/push", body)
         return PushResult(head=str(data.get("head") or expected_head), branch=str(data.get("branch") or branch))
 
 

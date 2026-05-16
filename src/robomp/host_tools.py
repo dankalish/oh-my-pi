@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -22,14 +23,32 @@ from omp_rpc import HostTool, HostToolContext, RpcCommandError, host_tool
 from robomp import persona
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.git_ops import GitCommandError, HeadDriftError, rev_parse_head
+from robomp.git_ops import GitCommandError, HeadDriftError
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueInfo, RepoInfo
-from robomp.sandbox import GitTransport, Workspace, rename_workspace_branch, validate_branch_slug, workspace_key
+from robomp.sandbox import (
+    GitTransport,
+    Workspace,
+    _prepare_slot_runtime_env,
+    _safe_directory_env,
+    _share_git_metadata_with_slots,
+    _slot_permissions_active,
+    _slot_subprocess_kwargs,
+    rename_workspace_branch,
+    validate_branch_slug,
+    workspace_key,
+)
 
 log = logging.getLogger(__name__)
 _PRE_PR_FIX_COMMAND = ("bun", "run", "fix")
 _PRE_PR_CHECK_COMMAND = ("bun", "check")
+_REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
+    "GITHUB_TOKEN",
+    "GITHUB_WEBHOOK_SECRET",
+    "ROBOMP_REPLAY_TOKEN",
+    "ROBOMP_GH_PROXY_HMAC_KEY",
+)
+_AGENT_HOME = Path("/srv/agent-home")
 _PRE_PR_FIX_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_MAX_OUTPUT = 12_000
@@ -127,6 +146,55 @@ def _raise_command(message: str) -> NoReturn:
     raise RpcCommandError(message, error={"message": message})
 
 
+def _git_identity_env(author_name: str, author_email: str) -> dict[str, str]:
+    """Environment forcing agent git commits to use the configured bot identity."""
+    return {
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": author_name,
+        "GIT_COMMITTER_EMAIL": author_email,
+    }
+
+
+def _repo_command_env(bindings: ToolBindings) -> dict[str, str]:
+    """Environment for repo-owned commands (`bun`, formatter, local git).
+
+    These commands execute code from the checked-out repository, so they must
+    not inherit GitHub credentials from the orchestrator. They also need the
+    exact same HOME/XDG/TMP/Bun cache paths as the agent process; otherwise
+    host-side pre-publish gates validate a different machine than the agent saw.
+    """
+    env = os.environ.copy()
+    for key in _REPO_COMMAND_SCRUBBED_ENV_KEYS:
+        env[key] = ""
+    if _AGENT_HOME.is_dir():
+        env["HOME"] = str(_AGENT_HOME)
+    env.update(_prepare_slot_runtime_env(bindings.workspace, bindings.slot_uid))
+    env.update(_safe_directory_env(bindings.workspace.repo_dir))
+    env.update(_git_identity_env(bindings.author_name, bindings.author_email))
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _run_repo_command(
+    bindings: ToolBindings,
+    cmd: list[str] | tuple[str, ...],
+    *,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a repo-local command with agent-equivalent permissions and env."""
+    return subprocess.run(
+        list(cmd),
+        cwd=str(bindings.workspace.repo_dir),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=_repo_command_env(bindings),
+        **_slot_subprocess_kwargs(bindings.slot_uid),
+    )
+
+
 def _has_bun_script(repo_dir: Path, name: str) -> bool:
     """Return True iff `package.json` defines a `scripts.<name>` entry.
 
@@ -198,19 +266,12 @@ def _run_pre_publish_bun_fix(
     """
     if not _has_bun_script(bindings.workspace.repo_dir, "fix"):
         return
-    repo_dir = str(bindings.workspace.repo_dir)
     # Dirty-tree gate BEFORE the formatter so any pre-existing uncommitted
     # edit isn't silently swept into the `style: bun run fix` commit by the
     # `git add -A` below. The agent owns the worktree end-to-end; any diff
     # not already in a commit is a workflow bug it must resolve before we
     # mutate the tree further.
-    pre_status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=normal"],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    pre_status = _run_repo_command(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"])
     if pre_status.stdout.strip():
         dirty = "\n  ".join(pre_status.stdout.strip().splitlines())
         msg = (
@@ -231,14 +292,7 @@ def _run_pre_publish_bun_fix(
         )
         return
     try:
-        proc = subprocess.run(
-            _PRE_PR_FIX_COMMAND,
-            cwd=repo_dir,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_PRE_PR_FIX_TIMEOUT_SECONDS,
-        )
+        proc = _run_repo_command(bindings, _PRE_PR_FIX_COMMAND, timeout=_PRE_PR_FIX_TIMEOUT_SECONDS)
     except FileNotFoundError:
         msg = f"refusing to {stage}: `bun run fix` is required before {stage}, but `bun` is not on PATH."
         _audit(bindings, tool_name, args, error=msg)
@@ -264,29 +318,18 @@ def _run_pre_publish_bun_fix(
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=normal"],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    status = _run_repo_command(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"])
     if not status.stdout.strip():
         return
 
-    add = subprocess.run(
-        ["git", "add", "-A"],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    add = _run_repo_command(bindings, ["git", "add", "-A"])
     if add.returncode != 0:
         err = (add.stderr or add.stdout).strip()
         msg = f"refusing to {stage}: `git add -A` failed after `bun run fix`: {err}"
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
-    commit = subprocess.run(
+    commit = _run_repo_command(
+        bindings,
         [
             "git",
             "-c",
@@ -297,10 +340,6 @@ def _run_pre_publish_bun_fix(
             "-m",
             _PRE_PR_FIX_COMMIT_SUBJECT,
         ],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
     )
     if commit.returncode != 0:
         err = (commit.stderr or commit.stdout).strip()
@@ -332,14 +371,7 @@ def _run_pre_publish_bun_check(
     if not _has_bun_script(bindings.workspace.repo_dir, "check"):
         return
     try:
-        proc = subprocess.run(
-            _PRE_PR_CHECK_COMMAND,
-            cwd=str(bindings.workspace.repo_dir),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_PRE_PR_CHECK_TIMEOUT_SECONDS,
-        )
+        proc = _run_repo_command(bindings, _PRE_PR_CHECK_COMMAND, timeout=_PRE_PR_CHECK_TIMEOUT_SECONDS)
     except FileNotFoundError:
         msg = f"refusing to {stage}: `bun check` is required before {stage}, but `bun` is not on PATH."
         _audit(bindings, tool_name, args, error=msg)
@@ -486,40 +518,24 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
         _raise_command(
             f"refusing to push: branch={branch!r} does not match workspace branch {bindings.workspace.branch!r}."
         )
-    repo_dir = str(bindings.workspace.repo_dir)
     # Re-pin the configured identity right before push (cheap; idempotent).
-    subprocess.run(
-        ["git", "config", "user.email", bindings.author_email],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", bindings.author_name],
-        cwd=repo_dir,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    _run_repo_command(bindings, ["git", "config", "user.email", bindings.author_email])
+    _run_repo_command(bindings, ["git", "config", "user.name", bindings.author_name])
     repo_dir_path = bindings.workspace.repo_dir
-    try:
-        head_sha = rev_parse_head(repo_dir_path)
-    except GitCommandError as exc:
-        err = (exc.stderr or exc.stdout).strip() or f"exit {exc.returncode}"
+    head_proc = _run_repo_command(bindings, ["git", "rev-parse", "HEAD"])
+    if head_proc.returncode != 0:
+        err = (head_proc.stderr or head_proc.stdout).strip() or f"exit {head_proc.returncode}"
         _audit(bindings, tool_name, args, error=err)
         _raise_command(f"git rev-parse failed: {err}")
+    head_sha = head_proc.stdout.strip()
 
     # Identity gate: every commit between the base branch and HEAD must
     # carry the configured author. Refuse to push otherwise so the agent
     # fixes it (`git commit --amend --reset-author --no-edit`).
     base = bindings.repo.default_branch
-    identities = subprocess.run(
+    identities = _run_repo_command(
+        bindings,
         ["git", "log", "--format=%H%x09%ae%x09%an", f"origin/{base}..HEAD"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
     )
     if identities.returncode != 0:
         err = (identities.stderr or identities.stdout).strip()
@@ -551,13 +567,7 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
     # forgot to `git add && git commit`, files dropped by package managers, etc.)
     # would silently land in the PR review delta but not in the commit history.
     # Reject so the agent either commits or stashes them.
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=normal"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    status = _run_repo_command(bindings, ["git", "status", "--porcelain", "--untracked-files=normal"])
     if status.stdout.strip():
         dirty = "\n  ".join(status.stdout.strip().splitlines())
         msg = (
@@ -576,6 +586,7 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
             repo_dir=repo_dir_path,
             branch=branch,
             expected_head=head_sha,
+            slot_uid=bindings.slot_uid,
         )
     except HeadDriftError:
         msg = (
@@ -592,6 +603,7 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
         msg = f"gh-proxy rejected push: {exc.status} {exc.message}"
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
+    _share_git_metadata_with_slots(repo_dir_path, bindings.slot_uid)
     _audit(bindings, tool_name, args, result={"head": result.head, "branch": result.branch})
     return result.head
 
@@ -803,6 +815,12 @@ def _build_repro_record(bindings: ToolBindings) -> HostTool[Any, Any]:
             f"## Output\n\n```\n{output}\n```\n",
             encoding="utf-8",
         )
+        # Single-ownership invariant: workspace files belong to the active
+        # slot. The orchestrator (root) wrote this file directly, so hand it
+        # over before the audit row lands so the agent can edit/delete it.
+        if _slot_permissions_active(bindings.slot_uid):
+            assert bindings.slot_uid is not None
+            os.chown(target, bindings.slot_uid, bindings.slot_uid)
         _audit(bindings, "repro_record", args, result={"path": str(target.relative_to(bindings.workspace.root))})
         return "recorded"
 

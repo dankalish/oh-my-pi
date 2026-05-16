@@ -16,11 +16,14 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import platform
 import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +36,43 @@ _BAD_OBJECT_REF_RE = re.compile(
     r"(?:fatal: bad object (?P<bad>refs/[^\s]+)|error: (?P<invalid>refs/[^\s]+) does not point to a valid object!)"
 )
 _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
+
+_SHARED_OMP_GID = 2000
+_AGENT_HOME = Path("/srv/agent-home")
+
+
+def _slot_permissions_active(slot_uid: int | None) -> bool:
+    return slot_uid is not None and platform.system() == "Linux" and os.geteuid() == 0
+
+
+def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
+    if not _slot_permissions_active(slot_uid):
+        return {}
+    assert slot_uid is not None
+    return {"user": slot_uid, "group": slot_uid, "extra_groups": [_SHARED_OMP_GID], "umask": 0o002}
+
+
+def _append_safe_directory(env: dict[str, str], repo_dir: Path) -> None:
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
+    env[f"GIT_CONFIG_VALUE_{count}"] = str(repo_dir)
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+
+
+def _local_remote_safe_directory(remote_url: str, *, cwd: Path) -> Path | None:
+    """Return a local filesystem remote path that git may need whitelisted."""
+    raw = remote_url.strip()
+    if not raw:
+        return None
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        if parsed.netloc not in ("", "localhost"):
+            return None
+        return Path(parsed.path)
+    if "://" in raw or re.match(r"^[^/\\s]+:", raw):
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else (cwd / path).resolve()
 
 
 def redact_credentials(text: str | None) -> str:
@@ -86,6 +126,11 @@ def _run_git(
     cwd: Path | None,
     token: str | None,
     extra_env: Mapping[str, str] | None = None,
+    safe_directory: Path | None = None,
+    user: int | None = None,
+    group: int | None = None,
+    extra_groups: list[int] | tuple[int, ...] | None = None,
+    umask: int | None = None,
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run `git <args>` with optional PAT injection via `--config-env`.
@@ -101,8 +146,13 @@ def _run_git(
     `_DEFAULT_GIT_TIMEOUT_SECONDS`.
     """
     env: dict[str, str] = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    if user is not None and _AGENT_HOME.is_dir():
+        env["HOME"] = str(_AGENT_HOME)
     if extra_env:
         env.update(extra_env)
+    if safe_directory is not None:
+        _append_safe_directory(env, safe_directory)
+
     cmd: list[str] = ["git"]
     if token:
         env[AUTH_ENV_VAR] = _basic_auth_header(token)
@@ -110,6 +160,15 @@ def _run_git(
     cmd.extend(args)
     log.debug("git", extra={"cmd": _redacted_cmd(cmd), "cwd": str(cwd) if cwd else None})
     effective_timeout = _DEFAULT_GIT_TIMEOUT_SECONDS if timeout is None else timeout
+    subprocess_kwargs: dict[str, Any] = {}
+    if user is not None:
+        subprocess_kwargs["user"] = user
+    if group is not None:
+        subprocess_kwargs["group"] = group
+    if extra_groups is not None:
+        subprocess_kwargs["extra_groups"] = extra_groups
+    if umask is not None:
+        subprocess_kwargs["umask"] = umask
     try:
         proc = subprocess.run(
             cmd,
@@ -119,6 +178,7 @@ def _run_git(
             capture_output=True,
             text=True,
             timeout=effective_timeout,
+            **subprocess_kwargs,
         )
     except subprocess.TimeoutExpired as exc:
         # `subprocess.run` already kills the direct child when the timeout
@@ -327,6 +387,7 @@ def clone(
     clone_url: str,
     default_branch: str,
     token: str | None,
+    safe_directory: Path | None = None,
 ) -> None:
     """Fresh `git clone --filter=blob:none` into `target`."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -339,10 +400,10 @@ def clone(
         clone_url,
         str(target),
     ]
-    _check(_run_git(args, cwd=None, token=token), ["git", *args])
+    _check(_run_git(args, cwd=None, token=token, safe_directory=safe_directory), ["git", *args])
 
 
-def fetch_prune(repo_dir: Path, *, token: str | None) -> None:
+def fetch_prune(repo_dir: Path, *, token: str | None, safe_directory: Path | None = None) -> None:
     """`git fetch --prune origin` on the shared pool clone.
 
     Pool clones are long-lived. If a transient git object alternate leaks into
@@ -356,7 +417,7 @@ def fetch_prune(repo_dir: Path, *, token: str | None) -> None:
     _prune_missing_alternates(repo_dir)
     last_proc: subprocess.CompletedProcess[str] | None = None
     for _ in range(_FETCH_PRUNE_REPAIR_ATTEMPTS):
-        proc = _run_git(args, cwd=repo_dir, token=token)
+        proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
         if proc.returncode == 0:
             return
         last_proc = proc
@@ -367,10 +428,10 @@ def fetch_prune(repo_dir: Path, *, token: str | None) -> None:
     _check(last_proc, ["git", *args])
 
 
-def fetch_ref(repo_dir: Path, ref: str, *, token: str | None) -> None:
+def fetch_ref(repo_dir: Path, ref: str, *, token: str | None, safe_directory: Path | None = None) -> None:
     """`git fetch origin <ref>` (best-effort: caller decides to swallow)."""
     args = ["fetch", "origin", ref]
-    proc = _run_git(args, cwd=repo_dir, token=token)
+    proc = _run_git(args, cwd=repo_dir, token=token, safe_directory=safe_directory)
     if proc.returncode != 0:
         log.debug(
             "fetch_ref non-fatal failure",
@@ -392,22 +453,29 @@ class HeadDriftError(GitCommandError):
     """
 
 
-def rev_parse_head(repo_dir: Path) -> str:
+def rev_parse_head(
+    repo_dir: Path,
+    *,
+    safe_directory: Path | None = None,
+    user: int | None = None,
+    group: int | None = None,
+    extra_groups: list[int] | tuple[int, ...] | None = None,
+    umask: int | None = None,
+) -> str:
     """Return the SHA of HEAD or raise GitCommandError."""
-    proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(repo_dir),
-        check=False,
-        capture_output=True,
-        text=True,
+    args = ["rev-parse", "HEAD"]
+    proc = _run_git(
+        args,
+        cwd=repo_dir,
+        token=None,
+        safe_directory=safe_directory,
+        user=user,
+        group=group,
+        extra_groups=extra_groups,
+        umask=umask,
     )
     if proc.returncode != 0:
-        raise GitCommandError(
-            ["git", "rev-parse", "HEAD"],
-            proc.returncode,
-            proc.stdout,
-            proc.stderr,
-        )
+        raise GitCommandError(["git", *args], proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout.strip()
 
 
@@ -417,6 +485,8 @@ def push(
     branch: str,
     expected_head: str | None,
     token: str | None,
+    slot_uid: int | None = None,
+    safe_directory: Path | None = None,
 ) -> PushResult:
     """`git push --force-with-lease=<ref>:<sha> --set-upstream origin <branch>` from `repo_dir`.
 
@@ -440,7 +510,12 @@ def push(
     the push is aborted with `HeadDriftError`. This is a separate concern from
     `--force-with-lease`, which compares against the remote ref.
     """
-    head = rev_parse_head(repo_dir)
+    slot_kwargs = _slot_subprocess_kwargs(slot_uid)
+    git_safe_directory = safe_directory
+    if git_safe_directory is None and slot_kwargs:
+        git_safe_directory = repo_dir
+
+    head = rev_parse_head(repo_dir, safe_directory=git_safe_directory, **slot_kwargs)
     if expected_head and head != expected_head:
         raise HeadDriftError(
             ["git", "push"],
@@ -455,11 +530,27 @@ def push(
         ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
         cwd=repo_dir,
         token=None,
+        safe_directory=git_safe_directory,
+        **slot_kwargs,
     )
     expected_remote = probe.stdout.strip() if probe.returncode == 0 else ""
+    push_extra_env: dict[str, str] | None = None
+    origin = _run_git(
+        ["remote", "get-url", "origin"], cwd=repo_dir, token=None, safe_directory=git_safe_directory, **slot_kwargs
+    )
+    if origin.returncode == 0:
+        local_remote = _local_remote_safe_directory(origin.stdout, cwd=repo_dir)
+        if local_remote is not None:
+            push_extra_env = {}
+            _append_safe_directory(push_extra_env, local_remote)
     lease = f"--force-with-lease=refs/heads/{branch}:{expected_remote}"
     args = ["push", lease, "--set-upstream", "origin", branch]
-    _check(_run_git(args, cwd=repo_dir, token=token), ["git", *args])
+    _check(
+        _run_git(
+            args, cwd=repo_dir, token=token, extra_env=push_extra_env, safe_directory=git_safe_directory, **slot_kwargs
+        ),
+        ["git", *args],
+    )
     return PushResult(head=head, branch=branch)
 
 

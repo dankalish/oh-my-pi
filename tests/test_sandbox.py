@@ -13,10 +13,14 @@ from robomp.sandbox import (
     SandboxManager,
     Workspace,
     _chown_workspace,
+    _prepare_slot_runtime_env,
     _prepare_slot_tmpdir,
+    _provision_runtime_dirs,
     _reap_slot,
+    _safe_directory_env,
     _share_git_metadata_with_slots,
     _slot_pids,
+    _slot_subprocess_kwargs,
     make_branch,
     rename_workspace_branch,
     workspace_key,
@@ -153,6 +157,47 @@ def test_rename_workspace_branch_refreshes_shared_metadata(tmp_path: Path, monke
     rename_workspace_branch(ws, "fix-json-bom", slot_uid=2004)
 
     assert calls == [(repo_dir, 2004)]
+
+
+def test_rename_workspace_branch_runs_git_as_slot_when_permissions_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "ws"
+    repo_dir = root / "repo"
+    repo_dir.mkdir(parents=True)
+    initial = "farm/abc12345/some-issue"
+    ws = Workspace(
+        root=root,
+        repo_dir=repo_dir,
+        session_dir=root / ".omp-session",
+        context_dir=root / "context",
+        artifacts_dir=root / "artifacts",
+        branch=initial,
+        repo_full_name="octo/widget",
+        issue_number=1,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
+    monkeypatch.setattr("robomp.sandbox._share_git_metadata_with_slots", lambda _repo_dir, _slot_uid: None)
+
+    new_branch = rename_workspace_branch(ws, "fix-json-bom", slot_uid=2004)
+
+    assert new_branch == "farm/abc12345/fix-json-bom"
+    assert captured["cmd"] == ["git", "branch", "-m", initial, "farm/abc12345/fix-json-bom"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["cwd"] == str(repo_dir)
+    assert kwargs["user"] == 2004
+    assert kwargs["group"] == 2004
+    assert kwargs["extra_groups"] == [2000]
 
 
 def test_rename_workspace_branch_is_idempotent_when_slug_unchanged(tmp_path: Path) -> None:
@@ -384,9 +429,61 @@ def test_chown_workspace_runs_chown_and_chmod_as_root_on_linux(tmp_path: Path, m
 
     # 2001 is the slot-private GID matching the slot UID, not the shared omp group.
     assert calls == [
-        (["chown", "-R", "0:2001", str(tmp_path)], True),
+        (["chown", "-R", "2001:2001", str(tmp_path)], True),
         (["chmod", "-R", "u=rwX,g=rwX,o=", str(tmp_path)], True),
     ]
+
+
+def test_chown_workspace_makes_workspace_slot_owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    file_path = subdir / "file.txt"
+    file_path.write_text("data\n", encoding="utf-8")
+    tmp_path.chmod(0o777)
+    subdir.chmod(0o777)
+    file_path.chmod(0o777)
+    owned: dict[Path, tuple[int, int]] = {}
+
+    def fake_run(cmd: list[str], *, check: bool) -> None:
+        assert check
+        if cmd[:2] == ["chown", "-R"]:
+            uid_text, gid_text = cmd[2].split(":", 1)
+            root = Path(cmd[3])
+            uid = int(uid_text)
+            gid = int(gid_text)
+            owned[root] = (uid, gid)
+            for current_root, dirs, files in os.walk(root):
+                current = Path(current_root)
+                owned[current] = (uid, gid)
+                for dirname in dirs:
+                    owned[current / dirname] = (uid, gid)
+                for filename in files:
+                    owned[current / filename] = (uid, gid)
+        elif cmd[:3] == ["chmod", "-R", "u=rwX,g=rwX,o="]:
+            root = Path(cmd[3])
+            root.chmod(0o770)
+            for current_root, dirs, files in os.walk(root):
+                current = Path(current_root)
+                current.chmod(0o770)
+                for dirname in dirs:
+                    (current / dirname).chmod(0o770)
+                for filename in files:
+                    (current / filename).chmod(0o660)
+        else:
+            raise AssertionError(f"unexpected command: {cmd!r}")
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
+
+    _chown_workspace(tmp_path, 2001)
+
+    assert owned[tmp_path] == (2001, 2001)
+    assert owned[subdir] == (2001, 2001)
+    assert owned[file_path] == (2001, 2001)
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o770
+    assert stat.S_IMODE(subdir.stat().st_mode) == 0o770
+    assert stat.S_IMODE(file_path.stat().st_mode) == 0o660
 
 
 def test_slot_pids_reads_proc_status_and_skips_zombies(tmp_path: Path) -> None:
@@ -442,7 +539,7 @@ def test_reap_slot_kills_slot_uid_on_linux_root(monkeypatch: pytest.MonkeyPatch)
     assert calls == [(111, signal.SIGKILL), (222, signal.SIGKILL)]
 
 
-def test_prepare_slot_tmpdir_chowns_slot_and_locks_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_prepare_slot_tmpdir_mkdirs_without_chown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     chowns: list[tuple[Path, int, int]] = []
 
     monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
@@ -454,7 +551,7 @@ def test_prepare_slot_tmpdir_chowns_slot_and_locks_down(tmp_path: Path, monkeypa
     assert tmpdir == tmp_path / ".omp-tmp"
     assert tmpdir.is_dir()
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
-    assert chowns == [(tmpdir, 2001, 2001)]
+    assert chowns == []
 
 
 def test_prepare_slot_tmpdir_replaces_symlink_without_touching_target(tmp_path: Path) -> None:
@@ -469,6 +566,73 @@ def test_prepare_slot_tmpdir_replaces_symlink_without_touching_target(tmp_path: 
     assert prepared.is_dir()
     assert not prepared.is_symlink()
     assert target.is_dir()
+
+
+def test_provision_runtime_dirs_replaces_tmpdir_symlink_and_creates_xdg_tree(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    tmpdir = tmp_path / ".omp-tmp"
+    tmpdir.symlink_to(target, target_is_directory=True)
+
+    _provision_runtime_dirs(tmp_path)
+
+    assert tmpdir.is_dir()
+    assert not tmpdir.is_symlink()
+    assert target.is_dir()
+    assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
+    for base in (tmp_path / ".omp-xdg" / "data", tmp_path / ".omp-xdg" / "state", tmp_path / ".omp-xdg" / "cache"):
+        assert base.is_dir()
+        assert (base / "omp").is_dir()
+    assert (tmp_path / ".omp-xdg" / "cache" / "bun-install").is_dir()
+
+
+def test_safe_directory_env_scopes_single_repo_path(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+
+    assert _safe_directory_env(repo_dir) == {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(repo_dir),
+    }
+
+
+def test_slot_subprocess_kwargs_run_as_slot_on_linux_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+
+    assert _slot_subprocess_kwargs(2001) == {
+        "user": 2001,
+        "group": 2001,
+        "extra_groups": [2000],
+        "umask": 0o002,
+    }
+
+
+def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chowns: list[tuple[Path, int, int]] = []
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chowns.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.sandbox.subprocess.run", lambda cmd, **_kwargs: calls.append(cmd))
+
+    ws = _workspace(tmp_path)
+    bun_cache = ws.root / ".omp-xdg" / "cache" / "bun-install"
+
+    env = _prepare_slot_runtime_env(ws, 2001)
+
+    assert env["TMPDIR"] == str(ws.root / ".omp-tmp")
+    assert env["XDG_CACHE_HOME"] == str(ws.root / ".omp-xdg" / "cache")
+    assert env["BUN_INSTALL_CACHE_DIR"] == str(bun_cache)
+    for base in (ws.root / ".omp-xdg" / "data", ws.root / ".omp-xdg" / "state", ws.root / ".omp-xdg" / "cache"):
+        assert base.is_dir()
+        assert (base / "omp").is_dir()
+    assert bun_cache.is_dir()
+    assert chowns == []
+    assert calls == []
 
 
 def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,7 +724,12 @@ def test_ensure_workspace_refreshes_permissions_for_retry_slot_and_session(
     assert ws2.session_dir == ws1.session_dir
     assert transcript.is_file()
     assert ws2.branch == ws1.branch
-    assert shared == [(ws1.repo_dir, 2001), (ws1.repo_dir, 2002)]
+    assert shared == [
+        (ws1.repo_dir, 2001),
+        (ws1.repo_dir, 2001),
+        (ws1.repo_dir, 2002),
+        (ws1.repo_dir, 2002),
+    ]
     assert chowns == [(ws1.root, 2001), (ws1.root, 2002)]
 
 
@@ -593,6 +762,66 @@ def test_ensure_workspace_preserves_checked_out_branch_on_replay(tmp_path: Path,
     assert ws2.branch == renamed
 
 
+def test_ensure_workspace_runs_existing_worktree_git_as_slot_after_chown(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws1 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=47,
+        title="retry me",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        slot_uid=None,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    events: list[tuple[str, int | None]] = []
+    git_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        git_calls.append((cmd, kwargs))
+        if cmd[:3] == ["git", "remote", "get-url"]:
+            return subprocess.CompletedProcess(cmd, 0, f"{upstream_repo}\n", "")
+        if cmd[:4] == ["git", "symbolic-ref", "--quiet", "--short"]:
+            user = kwargs.get("user")
+            events.append(("symbolic-ref", user if isinstance(user, int) else None))
+            return subprocess.CompletedProcess(cmd, 0, f"{ws1.branch}\n", "")
+        if cmd[:2] == ["git", "config"]:
+            user = kwargs.get("user")
+            events.append(("config", user if isinstance(user, int) else None))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def record_chown(_ws_root: Path, slot_uid: int | None) -> None:
+        events.append(("chown", slot_uid))
+
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.subprocess.run", fake_run)
+    monkeypatch.setattr("robomp.sandbox._chown_workspace", record_chown)
+    monkeypatch.setattr("robomp.sandbox._share_git_metadata_with_slots", lambda _repo_dir, _slot_uid: None)
+
+    ws2 = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=47,
+        title="retry me",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        slot_uid=2002,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+
+    assert ws2.branch == ws1.branch
+    assert events[0] == ("chown", 2002)
+    assert ("symbolic-ref", 2002) in events
+    assert events.index(("chown", 2002)) < events.index(("symbolic-ref", 2002))
+    assert events.count(("config", 2002)) == 2
+    worktree_git = [kwargs for cmd, kwargs in git_calls if cmd[:2] in (["git", "symbolic-ref"], ["git", "config"])]
+    assert worktree_git
+    assert all(kwargs["user"] == 2002 and kwargs["group"] == 2002 for kwargs in worktree_git)
+
+
 def test_ensure_workspace_invokes_slot_chown(
     tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -616,6 +845,57 @@ def test_ensure_workspace_invokes_slot_chown(
     )
 
     assert calls == [(ws.root, 2001)]
+
+
+def test_ensure_workspace_provisions_and_slot_owns_runtime_dirs(
+    tmp_path: Path, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owned: dict[Path, tuple[int, int]] = {}
+    runtime_paths: list[Path] = []
+
+    def record_chown(ws_root: Path, slot_uid: int | None) -> None:
+        assert slot_uid is not None
+        paths = [
+            ws_root / ".omp-tmp",
+            ws_root / ".omp-xdg" / "data",
+            ws_root / ".omp-xdg" / "data" / "omp",
+            ws_root / ".omp-xdg" / "state",
+            ws_root / ".omp-xdg" / "state" / "omp",
+            ws_root / ".omp-xdg" / "cache",
+            ws_root / ".omp-xdg" / "cache" / "omp",
+            ws_root / ".omp-xdg" / "cache" / "bun-install",
+        ]
+        runtime_paths.extend(paths)
+        for path in paths:
+            assert path.is_dir()
+            owned[path] = (slot_uid, slot_uid)
+
+    monkeypatch.setattr("robomp.sandbox._chown_workspace", record_chown)
+    mgr = SandboxManager(tmp_path / "workspaces")
+
+    ws = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=46,
+        title="runtime perms",
+        clone_url=str(upstream_repo),
+        default_branch="main",
+        slot_uid=2001,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+
+    assert runtime_paths
+    assert set(runtime_paths) == {
+        ws.root / ".omp-tmp",
+        ws.root / ".omp-xdg" / "data",
+        ws.root / ".omp-xdg" / "data" / "omp",
+        ws.root / ".omp-xdg" / "state",
+        ws.root / ".omp-xdg" / "state" / "omp",
+        ws.root / ".omp-xdg" / "cache",
+        ws.root / ".omp-xdg" / "cache" / "omp",
+        ws.root / ".omp-xdg" / "cache" / "bun-install",
+    }
+    assert set(owned.values()) == {(2001, 2001)}
 
 
 def test_ensure_workspace_is_idempotent(tmp_path: Path, upstream_repo: Path) -> None:
@@ -854,6 +1134,42 @@ def test_push_force_with_lease_refuses_when_origin_moved(tmp_path: Path, upstrea
         "stale info" in (exc.value.stderr + exc.value.stdout).lower()
         or "rejected" in (exc.value.stderr + exc.value.stdout).lower()
     )
+
+
+def test_run_git_injects_safe_directory_and_subprocess_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.git_ops import _run_git
+
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("robomp.git_ops.subprocess.run", fake_run)
+
+    _run_git(
+        ["status"],
+        cwd=tmp_path,
+        token=None,
+        safe_directory=Path("/x"),
+        user=2001,
+        group=2001,
+        extra_groups=[2000],
+        umask=0o002,
+    )
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == "/x"
+    assert captured["user"] == 2001
+    assert captured["group"] == 2001
+    assert captured["extra_groups"] == [2000]
+    assert captured["umask"] == 0o002
 
 
 def test_run_git_kills_hung_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

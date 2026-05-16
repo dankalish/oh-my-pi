@@ -8,6 +8,32 @@ in `robomp.proxy_client` forwards the same set of operations over HMAC RPC.
 
 Per-issue worktree add/remove stays local — those operations only touch the
 shared on-disk pool clone, no remote authentication required.
+
+Permission model
+----------------
+There are four ownership zones on disk; do not let them blur:
+
+1. **Workspace tree** (`/data/workspaces/<key>/`, including `repo/`,
+   `.omp-session/`, `context/`, `artifacts/`, `.omp-tmp/`, `.omp-xdg/`):
+   single-owner. Owned by the active slot UID/GID (`omp-N`) with mode
+   `u=rwX,g=rwX,o=` (effectively `0770` dirs / `0660` files; the group is
+   the slot's own private gid so group bits are functionally identical to
+   owner-only). The orchestrator (root) reads/writes via uid-0 bypass when
+   it must, and drops to the slot for any subprocess that touches paths the
+   agent will revisit. `ensure_workspace` + `_chown_workspace` are the
+   single point of truth for this zone — no other helper sets ownership
+   inside `ws_root`.
+2. **Clone pool** (`/data/workspaces/_pool/<owner>__<repo>/`): genuinely
+   multi-slot. Owned by `root:omp` (gid 2000) with setgid `02770`; cross-slot
+   writes are bridged by `_share_git_metadata_with_slots`.
+3. **Language tool caches** (`/data/cache/{cargo,cargo-target,rustup,bun-cache}`):
+   multi-slot. Owned by `root:omp` with setgid `02770`; provisioned by
+   `entrypoint.sh`.
+4. **Agent HOME template** (`/srv/agent-home`): read-only, `root:root`
+   `0755/0644`.
+
+Bun's install cache stays workspace-private (zone 1) on purpose — bun
+chmod/utimes its own cache root, which breaks any shared-cache scheme.
 """
 
 from __future__ import annotations
@@ -24,7 +50,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from robomp.git_ops import (
     GitCommandError,
@@ -84,6 +110,22 @@ def _short_hex(seed: str | None = None) -> str:
 
 def workspace_key(repo: str, number: int) -> str:
     return f"{repo.replace('/', '__')}__{number}"
+
+
+def _safe_directory_env(repo_dir: Path) -> dict[str, str]:
+    """Return a Git config env overlay whitelisting ``repo_dir`` as safe."""
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": str(repo_dir),
+    }
+
+
+def _git_env_for_repo(repo_dir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(_safe_directory_env(repo_dir))
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
 
 
 def make_branch(*, issue_number: int, title: str, seed: str | None = None) -> str:
@@ -150,6 +192,7 @@ def rename_workspace_branch(
     proc = _safe_run(
         ["git", "branch", "-m", workspace.branch, new_branch],
         cwd=workspace.repo_dir,
+        **_slot_subprocess_kwargs(slot_uid),
     )
     if proc.returncode != 0:
         raise GitCommandError(
@@ -194,6 +237,7 @@ class GitTransport(Protocol):
         repo_dir: Path,
         branch: str,
         expected_head: str,
+        slot_uid: int | None = None,
     ) -> PushResult:
         """Push `branch` to origin. MUST refuse if HEAD has drifted from `expected_head`."""
         ...
@@ -232,15 +276,16 @@ class LocalGitTransport:
         repo_dir: Path,
         branch: str,
         expected_head: str,
+        slot_uid: int | None = None,
     ) -> PushResult:
         del repo, workspace_key
-        return git_push(repo_dir, branch=branch, expected_head=expected_head, token=self._token)
+        return git_push(repo_dir, branch=branch, expected_head=expected_head, token=self._token, slot_uid=slot_uid)
 
 
 # ---------- low-level helpers retained for callers expecting old shape ----------
 
 
-def _safe_run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def _safe_run(cmd: list[str], *, cwd: Path | None = None, **kwargs: Any) -> subprocess.CompletedProcess[str]:
     """Run without raising; caller decides on returncode. Credentials are redacted from any captured output."""
     proc = subprocess.run(
         cmd,
@@ -248,6 +293,7 @@ def _safe_run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.Complete
         check=False,
         capture_output=True,
         text=True,
+        **kwargs,
     )
     if proc.stdout:
         proc.stdout = redact_credentials(proc.stdout)
@@ -338,7 +384,18 @@ def _reap_slot(slot_uid: int | None) -> None:
 
 
 def _prepare_slot_tmpdir(workspace: Workspace, slot_uid: int | None) -> Path:
-    """Create the per-workspace temp directory used by the agent subprocess."""
+    """Return the per-workspace tmpdir path, idempotently provisioning it.
+
+    Ownership/mode is set by ``_chown_workspace`` as part of the workspace's
+    single-ownership invariant; this helper only:
+
+    - replaces any non-directory at ``.omp-tmp`` (symlink-protection: a user
+      who plants a symlink there could redirect later writes outside the
+      workspace regardless of who owns the destination), and
+    - ``mkdir(mode=0o700, exist_ok=True)`` as a safety net for callers that
+      run before ``ensure_workspace`` (e.g. unit tests with ``slot_uid=None``).
+    """
+    del slot_uid  # ownership is _chown_workspace's job; kept for call-site parity
     tmpdir = workspace.root / ".omp-tmp"
     try:
         st = tmpdir.lstat()
@@ -348,11 +405,87 @@ def _prepare_slot_tmpdir(workspace: Workspace, slot_uid: int | None) -> Path:
         if not stat.S_ISDIR(st.st_mode):
             tmpdir.unlink()
     tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if _slot_permissions_active(slot_uid):
-        assert slot_uid is not None
-        os.chown(tmpdir, slot_uid, slot_uid)
-    tmpdir.chmod(0o700)
     return tmpdir
+
+
+def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
+    """Return subprocess identity kwargs for commands that should run as a slot.
+
+    `preexec_fn` is intentionally avoided: the worker runs tasks in threads,
+    and `subprocess` warns that `preexec_fn` is unsafe in multithreaded
+    parents. Python's native `user` / `group` / `extra_groups` parameters do
+    the setuid/setgid work in the child safely.
+    """
+    if not _slot_permissions_active(slot_uid):
+        return {}
+    assert slot_uid is not None
+    return {"user": slot_uid, "group": slot_uid, "extra_groups": [_SHARED_OMP_GID], "umask": 0o002}
+
+
+def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dict[str, str]:
+    """Compute the env overlay (TMPDIR + XDG_*) for slot-side subprocesses.
+
+    Pure env helper: ownership of the workspace tree (including these XDG
+    paths and the bun install cache) is the single responsibility of
+    ``ensure_workspace``/``_chown_workspace``. The mkdir calls here exist
+    only as a safety net for callers that bypass ``ensure_workspace`` (unit
+    tests) or for the case where a runtime dir was deleted mid-process.
+
+    Cargo/rustup/target caches live under ``/data/cache/*`` (container ENV)
+    and are group-shared via ``omp``. Bun's install cache is explicitly
+    workspace-private because bun chmod/chowns its cache root, which makes a
+    cross-slot shared cache a permanent source of permission failures.
+    """
+    tmpdir = _prepare_slot_tmpdir(workspace, slot_uid)
+    xdg_root = workspace.root / ".omp-xdg"
+    xdg_data = xdg_root / "data"
+    xdg_state = xdg_root / "state"
+    xdg_cache = xdg_root / "cache"
+    bun_cache = xdg_cache / "bun-install"
+
+    for base in (xdg_data, xdg_state, xdg_cache):
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "omp").mkdir(parents=True, exist_ok=True)
+    bun_cache.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "TMPDIR": str(tmpdir),
+        "TMP": str(tmpdir),
+        "TEMP": str(tmpdir),
+        "XDG_DATA_HOME": str(xdg_data),
+        "XDG_STATE_HOME": str(xdg_state),
+        "XDG_CACHE_HOME": str(xdg_cache),
+        "BUN_INSTALL_CACHE_DIR": str(bun_cache),
+    }
+
+
+def _provision_runtime_dirs(ws_root: Path) -> None:
+    """Create the runtime dirs that ``_chown_workspace`` will hand to the slot.
+
+    Runs immediately before ``_chown_workspace`` so the recursive chown sweep
+    picks up ``.omp-tmp`` and the per-workspace XDG tree. Without this,
+    ``_prepare_slot_runtime_env`` would create them later from the orchestrator
+    process — leaving root-owned cache roots that bun/biome/cargo cannot
+    chmod/utime, the original source of the recurring permission failures.
+
+    Symlink-safe on ``.omp-tmp`` (replaces a planted non-directory in place).
+    """
+    tmpdir = ws_root / ".omp-tmp"
+    try:
+        st = tmpdir.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISDIR(st.st_mode):
+            tmpdir.unlink()
+    tmpdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    xdg_root = ws_root / ".omp-xdg"
+    for sub in ("data", "state", "cache"):
+        base = xdg_root / sub
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "omp").mkdir(parents=True, exist_ok=True)
+    (xdg_root / "cache" / "bun-install").mkdir(parents=True, exist_ok=True)
 
 
 def _grant_group_bits(path: Path, *, gid: int, bits: int) -> None:
@@ -436,19 +569,31 @@ def _share_git_metadata_with_slots(repo_dir: Path, slot_uid: int | None) -> None
         _grant_tree(common_dir / rel, gid=gid, files_group_writable=True)
 
 
-# slot_uid is also the slot-private GID created by entrypoint.sh. Do not use
-# the shared omp group for the workspace tree; that would let every slot read
-# every other slot's checkout, artifacts, context, and .omp-session. A retry may
-# acquire a different slot, so we recursively hand the private workspace tree to
-# the current slot before launching `omp --continue`.
 def _chown_workspace(ws_root: Path, slot_uid: int | None) -> None:
+    """Hand the entire workspace tree to the active slot UID/GID.
+
+    Single-ownership invariant: every file under ``ws_root`` ends up owned by
+    ``slot_uid:slot_uid`` with mode ``u=rwX,g=rwX,o=`` (``0770`` dirs / ``0660``
+    files). The slot's GID is its own private gid (created by entrypoint.sh),
+    so the group bits are functionally identical to owner-only — they exist
+    for parity with the existing pattern and to make accidental future
+    ``setgid`` use safe.
+
+    The orchestrator (root) keeps read/write access via uid-0 bypass; any
+    subprocess that touches paths the agent will revisit MUST drop to the slot
+    via ``_slot_subprocess_kwargs`` so tools like bun/biome/cargo (which
+    chmod/utime their own cache state) never encounter a non-owner file.
+
+    Self-healing on re-entry: an existing workspace left over from the old
+    ``root:slot`` model gets re-chown'd on the next ``ensure_workspace`` call.
+    """
     if slot_uid is None:
         return
     if platform.system() != "Linux":
         return
     if os.geteuid() != 0:
         return
-    subprocess.run(["chown", "-R", f"0:{slot_uid}", str(ws_root)], check=True)
+    subprocess.run(["chown", "-R", f"{slot_uid}:{slot_uid}", str(ws_root)], check=True)
     subprocess.run(["chmod", "-R", "u=rwX,g=rwX,o=", str(ws_root)], check=True)
 
 
@@ -544,7 +689,20 @@ class SandboxManager:
             seed=f"{repo}#{number}",
         )
 
-        if not (repo_dir / ".git").exists():
+        repo_exists = (repo_dir / ".git").exists()
+        workspace_prepared = False
+        slot_git_kwargs = _slot_subprocess_kwargs(slot_uid)
+        slot_git_env: dict[str, str] | None = None
+        if repo_exists:
+            # Existing workspaces are already slot-owned from the previous run.
+            # Refresh pool-side group bits, then hand the tree to the current
+            # slot before running any git command inside the worktree; root's
+            # uid-0 bypass does not bypass git's safe.directory ownership check.
+            _share_git_metadata_with_slots(repo_dir, slot_uid)
+            _provision_runtime_dirs(ws_root)
+            _chown_workspace(ws_root, slot_uid)
+            workspace_prepared = True
+        if not repo_exists:
             # Make sure the requested start point exists locally (best-effort).
             # For follow-ups on an existing PR, `existing_branch` is the remote
             # head branch we need to amend; starting from default would silently
@@ -575,7 +733,13 @@ class SandboxManager:
                     cwd=pool,
                 )
         else:
-            current = _safe_run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=repo_dir)
+            slot_git_env = _git_env_for_repo(repo_dir)
+            current = _safe_run(
+                ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+                cwd=repo_dir,
+                env=slot_git_env,
+                **slot_git_kwargs,
+            )
             if current.returncode == 0 and current.stdout.strip():
                 branch = current.stdout.strip()
                 if existing_branch is not None and existing_branch != branch:
@@ -584,11 +748,19 @@ class SandboxManager:
                         existing_branch,
                         branch,
                     )
-        # Identity is set on the worktree's shared config; idempotent.
-        _safe_run(["git", "config", "user.email", author_email], cwd=repo_dir)
-        _safe_run(["git", "config", "user.name", author_name], cwd=repo_dir)
+        if not workspace_prepared:
+            _share_git_metadata_with_slots(repo_dir, slot_uid)
+            _provision_runtime_dirs(ws_root)
+            _chown_workspace(ws_root, slot_uid)
+        if slot_git_env is None:
+            slot_git_env = _git_env_for_repo(repo_dir)
+        # Identity is set on the worktree's shared config; idempotent. Run as
+        # the slot after the chown so git never trips over safe.directory.
+        for command in (["git", "config", "user.email", author_email], ["git", "config", "user.name", author_name]):
+            proc = _safe_run(command, cwd=repo_dir, env=slot_git_env, **slot_git_kwargs)
+            if proc.returncode != 0:
+                raise GitCommandError(command, proc.returncode, proc.stdout, proc.stderr)
         _share_git_metadata_with_slots(repo_dir, slot_uid)
-        _chown_workspace(ws_root, slot_uid)
         return Workspace(
             root=ws_root,
             repo_dir=repo_dir,

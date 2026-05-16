@@ -285,17 +285,25 @@ async def test_run_rpc_uses_workspace_xdg_dirs_without_slot(tmp_path: Path, sett
     assert env["TMPDIR"] == str(tmpdir)
     assert env["TMP"] == str(tmpdir)
     assert env["TEMP"] == str(tmpdir)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == str(inputs.workspace.repo_dir)
+    assert env["GIT_AUTHOR_NAME"] == settings.resolved_author_name
+    assert env["GIT_AUTHOR_EMAIL"] == settings.git_author_email
+    assert env["GIT_COMMITTER_NAME"] == settings.resolved_author_name
+    assert env["GIT_COMMITTER_EMAIL"] == settings.git_author_email
     assert tmpdir.is_dir()
     assert stat.S_IMODE(tmpdir.stat().st_mode) == 0o700
 
 
 @pytest.mark.asyncio
-async def test_run_rpc_chowns_workspace_xdg_dirs_for_slot(
+async def test_run_rpc_uses_workspace_xdg_dirs_for_slot_without_chown(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     chown_calls: list[tuple[Path, int, int]] = []
-    monkeypatch.setattr("robomp.worker.os.geteuid", lambda: 0)
-    monkeypatch.setattr("robomp.worker.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
+    monkeypatch.setattr("robomp.sandbox.platform.system", lambda: "Linux")
+    monkeypatch.setattr("robomp.sandbox.os.geteuid", lambda: 0)
+    monkeypatch.setattr("robomp.sandbox.os.chown", lambda path, uid, gid: chown_calls.append((Path(path), uid, gid)))
 
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False, slot_uid=2001)
     loop = asyncio.new_event_loop()
@@ -311,11 +319,12 @@ async def test_run_rpc_chowns_workspace_xdg_dirs_for_slot(
         loop.close()
 
     env = _FakeRpcClient.instances[0].kwargs["env"]
-    expected_dirs = set()
     for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         base = Path(env[key])
-        expected_dirs.update({base, base / "omp"})
-    assert set(chown_calls) == {(path, 0, 2001) for path in expected_dirs}
+        assert base.is_dir()
+        assert (base / "omp").is_dir()
+    assert Path(env["BUN_INSTALL_CACHE_DIR"]).is_dir()
+    assert chown_calls == []
 
 
 @pytest.mark.asyncio

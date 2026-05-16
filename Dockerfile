@@ -50,13 +50,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     BUN_INSTALL=/opt/bun \
     PI_ROOT=/work/pi \
-    # Persistent build caches under the /data volume so cargo target,
-    # rustup toolchains, and bun's global package cache are shared across
-    # every per-issue worktree AND survive container restarts.
+    # Persistent build caches under the /data volume so cargo target and
+    # rustup toolchains are shared across every per-issue worktree and
+    # survive container restarts. Bun's install cache is deliberately
+    # workspace-private at runtime; bun chmod/chown behavior makes a shared
+    # cross-slot cache unreliable.
     CARGO_HOME=/data/cache/cargo \
     CARGO_TARGET_DIR=/data/cache/cargo-target \
     RUSTUP_HOME=/data/cache/rustup \
-    BUN_INSTALL_CACHE_DIR=/data/cache/bun-cache \
     PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 RUN apt-get update \

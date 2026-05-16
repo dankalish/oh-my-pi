@@ -16,7 +16,6 @@ import asyncio
 import logging
 import os
 import shutil
-import subprocess
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +35,8 @@ from robomp.config import Settings
 from robomp.db import Database, issue_key
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, RepoInfo
-from robomp.host_tools import AbortController, ToolBindings
-from robomp.sandbox import GitTransport, Workspace, _prepare_slot_tmpdir
+from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
+from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
 
 log = logging.getLogger(__name__)
 
@@ -184,48 +183,6 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     return env
-
-
-def _prepare_xdg_dirs(workspace: Workspace, slot_uid: int | None) -> dict[str, str]:
-    """Prepare per-workspace XDG homes for mutable omp state."""
-    xdg_root = workspace.root / ".omp-xdg"
-    homes = {
-        "XDG_DATA_HOME": xdg_root / "data",
-        "XDG_STATE_HOME": xdg_root / "state",
-        "XDG_CACHE_HOME": xdg_root / "cache",
-    }
-    should_chown = slot_uid is not None and os.geteuid() == 0
-    for base in homes.values():
-        omp_dir = base / "omp"
-        base.mkdir(parents=True, exist_ok=True)
-        omp_dir.mkdir(parents=True, exist_ok=True)
-        if not should_chown:
-            continue
-        assert slot_uid is not None
-        for path in (base, omp_dir):
-            try:
-                os.chown(path, 0, slot_uid)
-                path.chmod(0o770)
-            except OSError as exc:
-                log.warning("Failed to make XDG directory accessible to slot user %s: %s", path, exc)
-    if should_chown:
-        assert slot_uid is not None
-        # `sandbox._chown_workspace` runs `chown -R 0:slot` on the entire
-        # workspace tree, which flips slot-created cache files under
-        # `.omp-xdg/` (e.g. bun's `.pile` install cache) from `slot:slot`
-        # to `root:slot`. The next bun install hits `PermissionDenied`
-        # because bun chmod/utime's its own cache files and needs owner.
-        # Restore slot ownership recursively so bun (and any other tool
-        # using XDG paths) can touch its own cache.
-        try:
-            subprocess.run(
-                ["chown", "-R", f"{slot_uid}:{slot_uid}", str(xdg_root)],
-                check=True,
-                capture_output=True,
-            )
-        except (OSError, subprocess.CalledProcessError) as exc:
-            log.warning("Failed to recursively chown XDG root to slot %s: %s", slot_uid, exc)
-    return {key: str(path) for key, path in homes.items()}
 
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
@@ -451,9 +408,9 @@ def _run_rpc_blocking(
             log.debug("delta", extra={"issue": bindings.issue_key, "delta": str(ev.get("delta", ""))[:200]})
 
     rpc_env = _build_extra_env(settings)
-    slot_tmpdir = str(_prepare_slot_tmpdir(inputs.workspace, inputs.slot_uid))
-    rpc_env.update({"TMPDIR": slot_tmpdir, "TMP": slot_tmpdir, "TEMP": slot_tmpdir})
-    rpc_env.update(_prepare_xdg_dirs(inputs.workspace, inputs.slot_uid))
+    rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
+    rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
+    rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
     resuming = _has_prior_session(bindings.workspace.session_dir)
     extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
     log.info(

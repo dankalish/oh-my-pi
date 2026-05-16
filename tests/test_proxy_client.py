@@ -498,6 +498,38 @@ def test_proxy_git_transport_push_head_drift(proxy_settings: Settings, upstream_
     assert not _bare_has_branch(upstream_repo, branch)
 
 
+def test_proxy_git_transport_push_slot_uid_body() -> None:
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"head": "abc123", "branch": "farm/abc/feat"})
+
+    transport = ProxyGitTransport(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.MockTransport(handler),
+    )
+    transport.push_branch(
+        repo="octo/widget",
+        workspace_key="octo__widget__1",
+        repo_dir=Path("/unused"),
+        branch="farm/abc/feat",
+        expected_head="abc123",
+        slot_uid=2001,
+    )
+    transport.push_branch(
+        repo="octo/widget",
+        workspace_key="octo__widget__1",
+        repo_dir=Path("/unused"),
+        branch="farm/abc/feat",
+        expected_head="abc123",
+    )
+
+    assert captured[0]["slot_uid"] == 2001
+    assert "slot_uid" not in captured[1]
+
+
 # Sanity: signed POST headers from ProxyGitTransport._post verify cleanly.
 def test_proxy_git_transport_post_headers_verify() -> None:
     captured: list[httpx.Request] = []

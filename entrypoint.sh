@@ -23,6 +23,15 @@ elif [[ "${1:-}" == *"robomp.proxy"* ]]; then
 fi
 
 /usr/sbin/groupadd -f -g 2000 omp
+max_slots="${ROBOMP_MAX_CONCURRENCY:-8}"
+for i in $(seq 1 "$max_slots"); do
+    user="omp-$i"
+    slot_group="omp-$i"
+    slot_id=$((2000 + i))
+    /usr/sbin/groupadd -f -g "$slot_id" "$slot_group"
+    id -u "$user" >/dev/null 2>&1 || /usr/sbin/useradd -u "$slot_id" -g "$slot_group" -G omp -M -N -s /usr/sbin/nologin "$user"
+    /usr/sbin/usermod -g "$slot_group" -a -G omp "$user"
+done
 
 if [ "$is_proxy_role" -eq 1 ]; then
     exec "$@"
@@ -34,23 +43,17 @@ if [ ! -d "$PI_ROOT/packages/coding-agent" ]; then
     exit 1
 fi
 
-max_slots="${ROBOMP_MAX_CONCURRENCY:-8}"
-for i in $(seq 1 "$max_slots"); do
-    user="omp-$i"
-    slot_group="omp-$i"
-    slot_id=$((2000 + i))
-    /usr/sbin/groupadd -f -g "$slot_id" "$slot_group"
-    id -u "$user" >/dev/null 2>&1 || /usr/sbin/useradd -u "$slot_id" -g "$slot_group" -G omp -M -N -s /usr/sbin/nologin "$user"
-    /usr/sbin/usermod -g "$slot_group" -a -G omp "$user"
-done
-
 mkdir -p /data/workspaces /data/workspaces/_pool /data/logs
-# Persistent build caches under the /data volume. CARGO_HOME, CARGO_TARGET_DIR,
-# RUSTUP_HOME, and BUN_INSTALL_CACHE_DIR are pinned to these paths in the image
-# ENV so every per-issue worktree shares one cargo target and one bun cache.
-mkdir -p /data/cache/cargo /data/cache/cargo-target /data/cache/rustup /data/cache/bun-cache
+# Persistent build caches under the /data volume. CARGO_HOME,
+# CARGO_TARGET_DIR, and RUSTUP_HOME are pinned to these paths in the image ENV
+# so every per-issue worktree shares one cargo target/toolchain. Bun install
+# cache is workspace-private; a shared cache is unsafe across slot users
+# because bun may chmod/chown its cache root to the first writer.
+mkdir -p /data/cache/cargo /data/cache/cargo-target /data/cache/rustup
 chown -R root:omp /data/cache /data/workspaces/_pool
-chmod -R u=rwX,g=rwsX,o= /data/cache /data/workspaces/_pool
+find /data/cache /data/workspaces/_pool -type d -exec chmod 2770 {} +
+find /data/cache /data/workspaces/_pool -type f -perm /111 -exec chmod 0770 {} +
+find /data/cache /data/workspaces/_pool -type f ! -perm /111 -exec chmod 0660 {} +
 chmod 0700 /data/logs
 
 

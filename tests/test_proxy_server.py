@@ -156,6 +156,36 @@ async def _async_client(app) -> httpx.AsyncClient:
     )
 
 
+def test_read_origin_url_uses_safe_directory_and_slot_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from robomp.proxy import server as proxy_server
+
+    captured: dict[str, object] = {}
+    repo_dir = tmp_path / "repo"
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "https://github.com/octo/widget.git\n", "")
+
+    monkeypatch.setattr("robomp.proxy.server.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "robomp.proxy.server._slot_subprocess_kwargs",
+        lambda uid: {"user": uid, "group": uid, "extra_groups": [2000], "umask": 0o002},
+    )
+
+    assert proxy_server._read_origin_url(repo_dir, slot_uid=2001) == "https://github.com/octo/widget.git"
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env["GIT_CONFIG_VALUE_0"] == str(repo_dir)
+    assert captured["user"] == 2001
+    assert captured["group"] == 2001
+    assert captured["extra_groups"] == [2000]
+    assert captured["umask"] == 0o002
+
+
 # ============================================================================
 # HMAC behavior
 # ============================================================================
@@ -723,6 +753,62 @@ async def test_git_push_happy_path(proxy_settings: Settings, upstream_repo: Path
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"head": head, "branch": branch}
     assert _bare_has_branch(upstream_repo, branch)
+
+
+async def test_git_push_passes_slot_uid_to_git_push(
+    proxy_settings: Settings, upstream_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from robomp.git_ops import PushResult
+
+    branch = "farm/abc/slot"
+    repo_dir, head = _stage_workspace(proxy_settings, upstream_repo, "octo/widget", 1, branch)
+    captured: dict[str, object] = {}
+
+    def fake_git_push(path: Path, **kwargs: object) -> PushResult:
+        captured["path"] = path
+        captured.update(kwargs)
+        return PushResult(head=head, branch=branch)
+
+    monkeypatch.setattr("robomp.proxy.server.git_push", fake_git_push)
+    app = _build_app(proxy_settings)
+    body = (
+        b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"'
+        + branch.encode()
+        + b'","expected_head":"'
+        + head.encode()
+        + b'","slot_uid":2001}'
+    )
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/push",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/push", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured["path"] == repo_dir
+    assert captured["slot_uid"] == 2001
+
+
+@pytest.mark.parametrize("slot_uid", [0, -1, 65536])
+async def test_git_push_rejects_invalid_slot_uid(proxy_settings: Settings, slot_uid: int) -> None:
+    app = _build_app(proxy_settings)
+    body = (
+        b'{"repo":"octo/widget","workspace_key":"octo__widget__1","branch":"x","expected_head":"'
+        + (b"0" * 40)
+        + b'","slot_uid":'
+        + str(slot_uid).encode()
+        + b"}"
+    )
+    async with await _async_client(app) as client:
+        resp = await client.post(
+            "/gh/v1/git/push",
+            content=body,
+            headers={**_signed("POST", "/gh/v1/git/push", body), "Content-Type": "application/json"},
+        )
+
+    assert resp.status_code == 400
+    assert "slot_uid" in resp.text
 
 
 async def test_git_push_head_drift(proxy_settings: Settings, upstream_repo: Path) -> None:
